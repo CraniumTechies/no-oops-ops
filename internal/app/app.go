@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"github.com/AustinOyugi/no-oops-ops/internal/install/local"
 	"log/slog"
 
 	"github.com/AustinOyugi/no-oops-ops/internal/config"
@@ -20,7 +21,9 @@ func New(cfg config.Config) (*App, error) {
 
 	logger := logging.New()
 
-	localHost := install.NewLocalHost(logger, cfg.StateDir, cfg.InstallVersion, cfg.NetworkName)
+	localHost := local.NewHost(
+		logger, cfg.StateDir, cfg.InstallVersion,
+		cfg.NetworkName, cfg.RegistryName, cfg.RegistryPort)
 
 	installer, err := install.New(logger, localHost)
 
