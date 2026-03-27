@@ -41,9 +41,11 @@ func (i *Installer) Run(ctx context.Context) (Result, error) {
 		{name: StepVerifyDocker, run: i.host.VerifyDocker},
 		{name: StepEnsureSwarmInitialized, run: i.host.EnsureSwarmInitialized},
 		{name: StepEnsureSharedNetwork, run: i.host.EnsureSharedNetwork},
-		{name: StepEnsureRegistry, run: i.host.EnsureRegistry},
 		{name: StepPrepareStateDir, run: i.host.PrepareStateDir},
 		{name: StepInitializeLocalState, run: i.host.InitializeLocalState},
+		{name: StepWriteRegistryConfig, run: i.host.WriteRegistryConfig},
+		{name: StepWriteRegistryStack, run: i.host.WriteRegistryStack},
+		{name: StepEnsureRegistry, run: i.host.EnsureRegistry},
 		{name: StepWriteInstallMetadata, run: i.host.WriteInstallMetadata},
 	}
 
