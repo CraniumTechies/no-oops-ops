@@ -10,6 +10,25 @@ import (
 	"github.com/AustinOyugi/no-oops-ops/internal/platform/command"
 )
 
+func (h *Host) inspectRegistryService(ctx context.Context) bool {
+	err := h.InspectRegistryService(ctx)
+	return err == nil
+}
+
+func (h *Host) InspectRegistryService(ctx context.Context) error {
+	result, err := h.runner.Run(
+		ctx,
+		"docker",
+		[]string{"service", "inspect", h.registryService},
+		command.RunOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("inspect registry service %q: %w: %s", h.registryService, err, strings.TrimSpace(string(result.Output)))
+	}
+
+	return nil
+}
+
 func (h *Host) EnsureRegistry(ctx context.Context) error {
 	h.logger.InfoContext(
 		ctx,
@@ -18,13 +37,8 @@ func (h *Host) EnsureRegistry(ctx context.Context) error {
 		"port", h.registryPort,
 	)
 
-	_, err := h.runner.Run(
-		ctx,
-		"docker",
-		[]string{"service", "inspect", h.registryName},
-		command.RunOptions{},
-	)
-	if err == nil {
+	if h.inspectRegistryService(ctx) {
+		h.registryReady = true
 		return nil
 	}
 
@@ -39,6 +53,7 @@ func (h *Host) EnsureRegistry(ctx context.Context) error {
 		},
 		command.RunOptions{
 			StreamOutput: true,
+			LogCommand:   true,
 			Stdout:       os.Stdout,
 			Stderr:       os.Stderr,
 		},
@@ -49,6 +64,8 @@ func (h *Host) EnsureRegistry(ctx context.Context) error {
 			Err:   fmt.Errorf("deploy registry stack %q: %w: %s", h.registryName, err, strings.TrimSpace(string(result.Output))),
 		}
 	}
+
+	h.registryReady = h.inspectRegistryService(ctx)
 
 	return nil
 }
