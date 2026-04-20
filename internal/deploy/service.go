@@ -4,21 +4,25 @@ import (
 	"context"
 	"fmt"
 	"github.com/AustinOyugi/no-oops-ops/internal/config"
+	"github.com/AustinOyugi/no-oops-ops/internal/manifest"
+	"github.com/AustinOyugi/no-oops-ops/internal/platform/command"
 	"log/slog"
 	"path/filepath"
-
-	"github.com/AustinOyugi/no-oops-ops/internal/manifest"
+	"strings"
+	"time"
 )
 
 type Service struct {
 	logger *slog.Logger
 	config config.Config
+	runner *command.Runner
 }
 
 func NewService(logger *slog.Logger, cfg config.Config) *Service {
 	return &Service{
 		logger: logger,
 		config: cfg,
+		runner: command.NewRunner(logger),
 	}
 }
 
@@ -54,9 +58,35 @@ func (s *Service) Run(ctx context.Context, environment string, path string) (Res
 		return Result{}, err
 	}
 
+	if err := s.deployStack(ctx, stackPath, stackName(environment, m.Name)); err != nil {
+		return Result{}, err
+	}
+
+	if err := s.verifyService(ctx, swarmServiceName(environment, m.Name)); err != nil {
+		return Result{}, err
+	}
+
+	timeout, interval, err := readinessConfig(m)
+	if err != nil {
+		return Result{}, err
+	}
+
+	runningTasks, err := s.waitForRunningTasks(
+		ctx,
+		swarmServiceName(environment, m.Name),
+		timeout,
+		interval,
+	)
+	if err != nil {
+		return Result{}, err
+	}
+
 	return Result{
 		Environment:  environment,
 		ServiceName:  serviceName(environment, m.Name),
+		Executed:     true,
+		Verified:     true,
+		RunningTasks: runningTasks,
 		ManifestPath: absPath,
 		StackPath:    stackPath,
 		EnvFilePath:  envFilePath,
@@ -68,4 +98,196 @@ func (s *Service) Run(ctx context.Context, environment string, path string) (Res
 
 func resolveEnvFilePath(manifestPath string, envFile string) string {
 	return filepath.Join(filepath.Dir(manifestPath), envFile)
+}
+
+func (s *Service) deployStack(ctx context.Context, stackPath string, stackName string) error {
+	_, err := s.runner.Run(
+		ctx,
+		"docker",
+		[]string{
+			"stack",
+			"deploy",
+			"--compose-file",
+			stackPath,
+			stackName,
+		},
+		command.RunOptions{
+			LogCommand: true,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("deploy stack %q: %w", stackName, err)
+	}
+
+	return nil
+}
+
+func (s *Service) verifyService(ctx context.Context, serviceName string) error {
+	_, err := s.runner.Run(
+		ctx,
+		"docker",
+		[]string{
+			"service",
+			"inspect",
+			serviceName,
+		},
+		command.RunOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("verify service %q: %w", serviceName, err)
+	}
+
+	return nil
+}
+
+func (s *Service) runningTaskCount(ctx context.Context, serviceName string) (int, error) {
+	result, err := s.runner.Run(
+		ctx,
+		"docker",
+		[]string{
+			"service",
+			"ps",
+			"--filter",
+			"desired-state=running",
+			"--format",
+			"{{.CurrentState}}",
+			serviceName,
+		},
+		command.RunOptions{},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("inspect running tasks for service %q: %w", serviceName, err)
+	}
+
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(result.Output)), "\n") {
+		if line == "" {
+			continue
+		}
+
+		if strings.HasPrefix(line, "Running") {
+			count++
+		}
+	}
+
+	return count, nil
+}
+
+func readinessConfig(m manifest.Manifest) (time.Duration, time.Duration, error) {
+	timeout, err := time.ParseDuration(m.Rollout.ReadinessTimeout)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse rollout.readiness_timeout %q: %w", m.Rollout.ReadinessTimeout, err)
+	}
+
+	interval, err := time.ParseDuration(m.Rollout.ReadinessInterval)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse rollout.readiness_interval %q: %w", m.Rollout.ReadinessInterval, err)
+	}
+
+	return timeout, interval, nil
+}
+
+func (s *Service) waitForRunningTasks(
+	ctx context.Context,
+	serviceName string,
+	timeout time.Duration,
+	interval time.Duration,
+) (int, error) {
+	deadline := time.Now().Add(timeout)
+
+	s.logger.InfoContext(
+		ctx,
+		"waiting for service readiness",
+		"service", serviceName,
+		"timeout", timeout.String(),
+		"interval", interval.String(),
+	)
+
+	for {
+		runningTasks, err := s.runningTaskCount(ctx, serviceName)
+		if err != nil {
+			return 0, err
+		}
+
+		s.logger.InfoContext(
+			ctx,
+			"readiness poll",
+			"service", serviceName,
+			"running_tasks", runningTasks,
+		)
+
+		if runningTasks > 0 {
+
+			s.logger.InfoContext(
+				ctx,
+				"service ready",
+				"service", serviceName,
+				"running_tasks", runningTasks,
+			)
+
+			return runningTasks, nil
+		}
+
+		if time.Now().After(deadline) {
+			diagnostics, diagErr := s.taskDiagnostics(ctx, serviceName)
+			if diagErr != nil {
+				s.logger.ErrorContext(
+					ctx,
+					"service readiness timed out",
+					"service", serviceName,
+					"timeout", timeout.String(),
+				)
+				return 0, fmt.Errorf("service %q did not reach a running state within %s", serviceName, timeout)
+			}
+
+			s.logger.ErrorContext(
+				ctx,
+				"service readiness timed out",
+				"service", serviceName,
+				"timeout", timeout.String(),
+				"diagnostics", diagnostics,
+			)
+			return 0, fmt.Errorf(
+				"service %q did not reach a running state within %s: %s",
+				serviceName,
+				timeout,
+				diagnostics,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+func (s *Service) taskDiagnostics(ctx context.Context, serviceName string) (string, error) {
+	result, err := s.runner.Run(
+		ctx,
+		"docker",
+		[]string{
+			"service",
+			"ps",
+			"--no-trunc",
+			"--format",
+			"{{.CurrentState}}|{{.Error}}",
+			serviceName,
+		},
+		command.RunOptions{},
+	)
+	if err != nil {
+		return "", fmt.Errorf("inspect task diagnostics for service %q: %w", serviceName, err)
+	}
+
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(string(result.Output)), "\n") {
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, "; "), nil
 }
